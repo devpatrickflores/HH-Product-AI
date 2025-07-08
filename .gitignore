@@ -1,0 +1,9 @@
+# Ignore everything in exports folder and subfolders
+/exports/**
+
+# Ignore all CSV and XLSX files anywhere in the repo
+*.csv
+*.xlsx
+
+# Ignore VSCode folder
+.vscode/
