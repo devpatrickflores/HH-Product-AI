@@ -39,13 +39,26 @@ class MagentoProductProcessor:
         match = re.search(self.size_pattern, str(sku))
         return match.group(1) if match else None
 
+    def normalize_name(self, name):
+        # name = str(name).lower().strip()
+        # # Remove size suffix like "-SM", "-ML", etc.
+        # name = re.sub(r'\s*[-–]?(sm|s-m|ml|m-l)\s*$', '', name, flags=re.IGNORECASE).strip()
+        # # Remove any leftover trailing hyphen or dash with spaces
+        # name = re.sub(r'\s*[-–]\s*$', '', name).strip()
+        # return name
+        name = str(name).lower()
+        name = re.sub(r'[^a-z0-9 ]', '', name)  # remove all punctuation/special characters
+        name = re.sub(r'\s*[-–]?(sm|s-m|ml|m-l)\s*$', '', name, flags=re.IGNORECASE)  # remove size suffix
+        name = re.sub(r'\s+', ' ', name)  # collapse multiple spaces
+        return name.strip()
+
     def get_unassigned_variants(self):
         df = self.df
 
         if 'rd_' not in df.columns:
             df['rd_'] = ''
 
-        # ✅ Exclude rows with product_online == 2
+        # ✅ Exclude product_online = 2
         if 'product_online' in df.columns:
             df = df[df['product_online'] != 2]
 
@@ -71,7 +84,8 @@ class MagentoProductProcessor:
         unassigned['base_sku'] = unassigned['sku'].apply(lambda x: str(x).split('-')[0])
         unassigned['size'] = unassigned['sku'].apply(self.extract_size)
 
-        for col in ['name', 'visibility', 'base_image']:
+        # Ensure required columns exist
+        for col in ['name', 'visibility', 'base_image', 'product_online']:
             if col not in unassigned.columns:
                 unassigned[col] = ''
 
@@ -80,62 +94,69 @@ class MagentoProductProcessor:
 
     def generate_parent_products(self, unassigned_df):
         parent_products = []
-        grouped = unassigned_df.groupby('base_sku')
+        unassigned_df['normalized_name'] = unassigned_df['name'].apply(self.normalize_name)
+        grouped = unassigned_df.groupby('normalized_name')
 
-        for base_sku, group in grouped:
+        for normalized_name, group in grouped:
             if len(group) < 2:
-                continue  # Skip if fewer than 2 variants
+                continue  # Only generate parent if 2+ variants exist
 
             group = group.copy()
+            group['base_sku'] = group['sku'].apply(lambda x: str(x).split('-')[0])
             group['size_rank'] = group['size'].apply(
                 lambda s: self.size_priority.index(s) if s in self.size_priority else 99
             )
-            group_sorted = group.sort_values('size_rank')
+            group_sorted = group.sort_values(['size_rank'])
             template = group_sorted.iloc[0].copy()
 
-            parent_sku = f'P-{base_sku}'
+            # Use smallest base_sku as parent SKU
+            parent_base_sku = sorted(group['base_sku'])[0]
+            parent_sku = f'P-{parent_base_sku}'
+
             template['sku'] = parent_sku
+            template['name'] = normalized_name.upper()  # Title-case or upper for parent name
             template['visibility'] = 'Catalog, Search'
 
-            # Normalize name by removing size suffix
-            template['name'] = re.sub(r'\s*[-–]?(SM|S-M|ML|M-L)\s*$', '', str(template['name']), flags=re.IGNORECASE).strip()
-
-            # Include rd_ value from SM or S-M
+            # Use rd_ value from SM or S-M if available
             rd_values = group[group['size'].isin(['SM', 'S-M'])]['rd_'].dropna().unique()
             template['rd_'] = ','.join(rd_values) if len(rd_values) > 0 else ''
 
-            # Combine all unique base images
+            # Combine all base images (optional)
             template['base_image'] = ','.join(group['base_image'].dropna().unique())
 
-            parent_products.append(template.drop(['base_sku', 'size', 'size_rank'], errors='ignore'))
+            parent_products.append(template.drop([
+                'base_sku', 'size', 'size_rank', 'normalized_name'
+            ], errors='ignore'))
 
         print(f"🏗️ Created {len(parent_products)} parent products")
         return pd.DataFrame(parent_products)
 
     def export_to_excel(self, unassigned_df, parent_df, output_file="processed_output.xlsx"):
         with pd.ExcelWriter(output_file) as writer:
-            unassigned_df[['sku', 'name', 'visibility', 'product_online', 'base_image']].to_excel(
+            cols_unassigned = ['sku', 'name', 'visibility', 'product_online', 'base_image']
+            for col in cols_unassigned:
+                if col not in unassigned_df.columns:
+                    unassigned_df[col] = ''
+            unassigned_df[cols_unassigned].to_excel(
                 writer, sheet_name="Unassigned Variants", index=False
             )
 
-            required_cols = ['sku', 'name', 'visibility', 'product_online', 'base_image']
+            cols_parent = ['sku', 'name', 'visibility', 'product_online', 'base_image']
             if parent_df.empty:
                 print("⚠️ No parent products to export.")
-                parent_df = pd.DataFrame(columns=required_cols)
+                parent_df = pd.DataFrame(columns=cols_parent)
             else:
-                for col in required_cols:
+                for col in cols_parent:
                     if col not in parent_df.columns:
                         parent_df[col] = ''
 
-            parent_df[required_cols].to_excel(
+            parent_df[cols_parent].to_excel(
                 writer, sheet_name="Generated Parents", index=False
             )
 
         print(f"📤 Exported results to '{output_file}'")
 
-# ------------------------
-# Main Execution
-# ------------------------
+
 if __name__ == "__main__":
     file_arg = sys.argv[1] if len(sys.argv) > 1 else None
     processor = MagentoProductProcessor(file_arg)
